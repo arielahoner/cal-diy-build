@@ -3,13 +3,21 @@
 Construcción de la imagen Docker de [**cal.diy**](https://github.com/calcom/cal.diy) (fork comunitario MIT
 de cal.com) para una instancia personal autoalojada.
 
-cal.diy no publica imágenes propias, así que este repositorio hace una sola cosa: ejecutar
-`.github/workflows/build-image.yml`, que compila cal.diy en un runner de GitHub Actions, lo prueba y
-publica el resultado en GHCR.
+cal.diy no publica imágenes propias, así que este repositorio hace una sola cosa: compilar cal.diy en un
+runner de GitHub Actions, probarlo y publicar el resultado en GHCR. Son **dos** workflows y **dos**
+imágenes, porque la aplicación web y la API v2 se construyen por separado:
 
 ```text
-calcom/cal.diy@<sha>  →  GitHub Actions (linux/amd64)  →  ghcr.io/<owner>/cal-diy:<sha>
+calcom/cal.diy@<sha>  →  build-image.yml      →  ghcr.io/<owner>/cal-diy:<sha>       (aplicación web)
+                      →  build-api-image.yml  →  ghcr.io/<owner>/cal-diy-api:<sha>   (API v2)
 ```
+
+El `Dockerfile` raíz de cal.diy construye solo `@calcom/web`: copia `apps/api/v2` pero nunca lo compila.
+Por eso la API necesita su propio build, a partir de `apps/api/v2/Dockerfile` (sin modificarlo).
+
+> **Las dos imágenes van siempre en el mismo SHA.** Comparten base de datos y esquema de Prisma, así que
+> desemparejarlas puede dejar el cliente de Prisma de una desalineado con las migraciones de la otra.
+> `build-api-image.yml` comprueba que la imagen web del mismo SHA ya existe antes de empezar a construir.
 
 ## Uso
 
@@ -28,6 +36,26 @@ gh workflow run build-image.yml -f ref=176037d0 -f webapp_url=https://cal.ariels
 gh run watch
 ```
 
+### API v2
+
+Actions → **Construir imagen de la API v2 de Cal.diy** → *Run workflow*. Se lanza **después** de la web,
+con el mismo `ref`:
+
+| Entrada | Por defecto | Qué es |
+|---|---|---|
+| `ref` | `176037d0afbe…` | SHA de `calcom/cal.diy`. Debe ser el mismo que el de la imagen web. |
+| `push` | `true` | Publicar en GHCR. |
+| `skip_pairing_check` | `false` | Saltarse la comprobación de que existe la imagen web del mismo SHA. |
+
+```bash
+gh workflow run build-api-image.yml -f ref=176037d0afbe572f870a3c702985e7cd83fe6c0c -f push=true
+gh run watch
+```
+
+Su smoke test levanta Postgres y Redis efímeros, aplica las migraciones con la propia imagen, comprueba
+que `GET /health` responde `OK` y que `GET /v2/me` devuelve **401** tanto sin cabecera de autorización
+como con una clave inventada.
+
 Al terminar, el **resumen del run** trae la imagen, el digest, el tamaño y las líneas listas para pegar en
 el `VERSION.lock` del despliegue. La imagen se referencia siempre por digest:
 
@@ -35,8 +63,8 @@ el `VERSION.lock` del despliegue. La imagen se referencia siempre por digest:
 CALDIY_IMAGE=ghcr.io/<owner>/cal-diy:<sha>@sha256:<digest>
 ```
 
-El paquete de GHCR debe marcarse **público** (Packages → cal-diy → Package settings → Change visibility)
-para poder hacer `docker pull` desde el servidor sin token.
+Los paquetes de GHCR (`cal-diy` y `cal-diy-api`) deben marcarse **públicos** (Packages → el paquete →
+Package settings → Change visibility) para poder hacer `docker pull` desde el servidor sin token.
 
 ## Qué hace el workflow
 
