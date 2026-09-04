@@ -1,0 +1,418 @@
+# build-api-image.yml — copia canónica del workflow que construye la imagen de la API v2 de Cal.diy.
+#
+# Vive aquí (repo de control, privado) y se ejecuta en el repo PÚBLICO arielahoner/cal-diy-build,
+# en `.github/workflows/build-api-image.yml`. Cualquier cambio se hace primero aquí y se copia allí;
+# nunca al revés (ver build/README-repo-publico.md).
+#
+# QUÉ PRODUCE
+#   ghcr.io/arielahoner/cal-diy-api:<sha-corto>   (paquete público, linux/amd64)
+#
+# POR QUÉ EXISTE (D-027)
+#   Cal.diy NO trae API v1: `apps/api/` solo contiene `v2`. La imagen de la web (build-image.yml)
+#   construye únicamente `@calcom/web` — copia `apps/api/v2` pero nunca la compila. Sin esta segunda
+#   imagen, una API key creada en Settings → Developer → API keys no autentica contra nada.
+#
+# REGLA DE ORO: MISMO SHA QUE LA WEB
+#   La API y la web comparten la MISMA base de datos y el MISMO esquema de Prisma. Construir las dos
+#   desde SHAs distintos puede dejar el cliente de Prisma de una desalineado con las migraciones
+#   aplicadas por la otra. `ref` debe ser siempre el CALDIY_SHA_COMPLETO de deploy/VERSION.lock.
+#   El paso "Verificar emparejamiento" de abajo lo comprueba contra la imagen de la web ya publicada.
+#
+# DIFERENCIAS DELIBERADAS RESPECTO A build-image.yml
+#   - No hay build-arg NEXT_PUBLIC_*: la API es un NestJS, no hornea URLs (todo es runtime).
+#   - El Dockerfile de upstream (apps/api/v2/Dockerfile) es de UNA sola etapa: la imagen final lleva
+#     el monorepo entero con node_modules. Es grande (varios GB). Se acepta tal cual a propósito:
+#     adelgazarla exigiría inventar un multi-stage que upstream no mantiene y que se rompería en cada
+#     actualización. Si el disco de la VPS aprieta, revisar runbooks/api-v2.md §Mantenimiento.
+#   - El smoke test necesita Redis además de Postgres: sin REDIS_URL el proceso no arranca
+#     (apps/api/v2/src/config/app.ts lo lee con getEnv sin fallback).
+
+name: Construir imagen de la API v2 de Cal.diy
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "SHA completo de calcom/cal.diy — DEBE ser el mismo que la imagen web en producción (CALDIY_SHA_COMPLETO de VERSION.lock)"
+        required: true
+        default: "176037d0afbe572f870a3c702985e7cd83fe6c0c"
+      push:
+        description: "Publicar la imagen en GHCR"
+        type: boolean
+        default: true
+      skip_pairing_check:
+        description: "Saltar la verificación de emparejamiento con la imagen web (solo para el primer build de un SHA nuevo)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-api-image
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: calcom/cal.diy
+  IMAGE_NAME: cal-diy-api
+  WEB_IMAGE_NAME: cal-diy
+  # Postgres y Redis efímeros del runner. No son secretos: no sobreviven al job.
+  POSTGRES_USER: unicorn_user
+  POSTGRES_PASSWORD: magical_password
+  POSTGRES_DB: calendso
+
+jobs:
+  build:
+    name: Build linux/amd64 + smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      # -------------------------------------------------------------------------------------
+      - name: Validar entradas
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$REF" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$'; then
+            echo "::error::ref inválida: '$REF'"
+            exit 1
+          fi
+          echo "ref=$REF"
+
+      # -------------------------------------------------------------------------------------
+      - name: Resolver ref a SHA completo
+        id: resolve
+        env:
+          REF: ${{ inputs.ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha="$(gh api "repos/${UPSTREAM_REPO}/commits/${REF}" --jq '.sha')"
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::no se pudo resolver '$REF' a un SHA de calcom/cal.diy"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "'$REF' → $sha"
+
+      # -------------------------------------------------------------------------------------
+      # El login va antes del chequeo de emparejamiento porque ese paso consulta GHCR: así no depende
+      # de que el paquete siga siendo accesible de forma anónima.
+      - name: Login en GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # La API y la web comparten esquema de Prisma. Si la web publicada no está en este mismo SHA, el
+      # despliegue quedaría descompensado. Se comprueba aquí, antes de gastar 40 minutos de build.
+      - name: Verificar emparejamiento con la imagen web
+        if: ${{ !inputs.skip_pairing_check }}
+        env:
+          SHA_FULL: ${{ steps.resolve.outputs.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          tag_esperado="$(printf '%s' "$SHA_FULL" | cut -c1-8)"
+          echo "Buscando ghcr.io/${owner}/${WEB_IMAGE_NAME}:${tag_esperado}"
+          if docker manifest inspect "ghcr.io/${owner}/${WEB_IMAGE_NAME}:${tag_esperado}" >/dev/null 2>&1; then
+            echo "OK: existe la imagen web del mismo SHA."
+          else
+            echo "::error::No existe ghcr.io/${owner}/${WEB_IMAGE_NAME}:${tag_esperado}."
+            echo "::error::Construye primero la web con build-image.yml (ref=$SHA_FULL), o relanza"
+            echo "::error::este workflow con skip_pairing_check=true si sabes lo que haces."
+            exit 1
+          fi
+
+      # -------------------------------------------------------------------------------------
+      - name: Liberar disco del runner
+        run: |
+          set -euo pipefail
+          echo "Antes:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af || true
+          echo "Después:"; df -h / | tail -1
+
+      # -------------------------------------------------------------------------------------
+      - name: Checkout de cal.diy (upstream, solo lectura)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.resolve.outputs.sha }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Checkout de este repositorio (parches)
+        uses: actions/checkout@v4
+        with:
+          path: control
+          persist-credentials: false
+
+      # -------------------------------------------------------------------------------------
+      - name: Resolver SHA real y etiquetas
+        id: meta
+        run: |
+          set -euo pipefail
+          sha_full="$(git -C upstream rev-parse HEAD)"
+          sha_short="$(git -C upstream rev-parse --short=8 HEAD)"
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${owner}/${IMAGE_NAME}"
+          {
+            echo "sha_full=$sha_full"
+            echo "sha_short=$sha_short"
+            echo "image=$image"
+            echo "tag=$sha_short"
+          } >> "$GITHUB_OUTPUT"
+          echo "Construyendo $image:$sha_short desde $UPSTREAM_REPO@$sha_full"
+
+      # -------------------------------------------------------------------------------------
+      # Mismos parches que la web: si un parche toca packages/ compartidos, las dos imágenes deben
+      # llevarlo o quedarían con código distinto sobre la misma base de datos.
+      - name: Aplicar parches (si los hay)
+        id: patches
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(control/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "Sin parches."
+            echo "applied=0" >> "$GITHUB_OUTPUT"
+            echo "list=ninguno" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          names=""
+          for p in "${patches[@]}"; do
+            echo "::group::$p"
+            cat "$p"
+            echo "::endgroup::"
+            git -C upstream apply --check "../$p"
+            git -C upstream apply --stat --apply "../$p"
+            names="${names:+$names,}$(basename "$p")"
+          done
+          echo "applied=${#patches[@]}" >> "$GITHUB_OUTPUT"
+          echo "list=$names" >> "$GITHUB_OUTPUT"
+          echo "::warning::Imagen con ${#patches[@]} parche(s): $names. Se etiquetará con sufijo -patched."
+
+      - name: Etiqueta final
+        id: tag
+        env:
+          BASE_TAG: ${{ steps.meta.outputs.tag }}
+          APPLIED: ${{ steps.patches.outputs.applied }}
+        run: |
+          set -euo pipefail
+          if [ "$APPLIED" -gt 0 ]; then
+            echo "value=${BASE_TAG}-patched" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${BASE_TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -------------------------------------------------------------------------------------
+      # A diferencia de la web, el build de la API no necesita una base viva: `prisma generate` y
+      # `nest build` son estáticos. Postgres y Redis se levantan solo para el smoke test posterior.
+      - name: Configurar Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (sin publicar todavía)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          # Contexto = raíz del monorepo: el Dockerfile hace `COPY . .` y compila workspaces de yarn.
+          context: ./upstream
+          file: ./upstream/apps/api/v2/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.tag.outputs.value }}
+          build-args: |
+            DATABASE_URL=postgresql://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@database:5432/${{ env.POSTGRES_DB }}
+            DATABASE_DIRECT_URL=postgresql://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@database:5432/${{ env.POSTGRES_DB }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.sha_full }}
+            org.opencontainers.image.title=cal-diy-api-v2
+
+      # -------------------------------------------------------------------------------------
+      - name: Verificar la imagen (sin credenciales de build en la configuración)
+        env:
+          REF_IMAGE: ${{ steps.meta.outputs.image }}:${{ steps.tag.outputs.value }}
+        run: |
+          set -euo pipefail
+          echo "::group::Config.Env de la imagen"
+          docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$REF_IMAGE"
+          echo "::endgroup::"
+
+          # El Dockerfile de upstream hace `ENV DATABASE_URL=${DATABASE_URL}`, así que la cadena del
+          # Postgres efímero SÍ queda en Config.Env. No es un secreto real (base desechable del
+          # runner), pero debe apuntar al host "database", nunca a nada de producción.
+          env_db="$(docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$REF_IMAGE" \
+                     | sed -n 's/^DATABASE_URL=//p')"
+          if printf '%s' "$env_db" | grep -qv '@database:5432/'; then
+            echo "::error::DATABASE_URL horneada inesperada: no apunta al Postgres efímero del runner"
+            exit 1
+          fi
+          echo "OK: la DATABASE_URL horneada es la del runner (se sobrescribe en runtime por compose)."
+
+      # -------------------------------------------------------------------------------------
+      - name: Levantar Postgres y Redis efímeros
+        run: |
+          set -euo pipefail
+          docker network create smokenet
+          docker run -d --name database --network smokenet \
+            -e POSTGRES_USER="$POSTGRES_USER" \
+            -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+            -e POSTGRES_DB="$POSTGRES_DB" \
+            postgres:16
+          docker run -d --name redis --network smokenet redis:7-alpine
+          for i in $(seq 1 60); do
+            if docker exec database pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1; then
+              echo "Postgres listo tras ${i}s"; break
+            fi
+            sleep 1
+          done
+          docker exec redis redis-cli ping
+
+      - name: Smoke test (/health + auth + esquema de Prisma)
+        env:
+          REF_IMAGE: ${{ steps.meta.outputs.image }}:${{ steps.tag.outputs.value }}
+        run: |
+          set -euo pipefail
+          DB="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB}"
+
+          # Las migraciones las aplica la imagen WEB en producción; aquí se aplican con la propia
+          # imagen de la API para probar que su cliente de Prisma casa con el esquema del mismo SHA.
+          docker run --rm --network smokenet \
+            -e DATABASE_URL="$DB" -e DATABASE_DIRECT_URL="$DB" \
+            --entrypoint sh "$REF_IMAGE" -c \
+            'cd /calcom && yarn workspace @calcom/prisma db-deploy' | tail -20
+
+          docker run -d --name api-smoke --network smokenet \
+            -p 127.0.0.1:5555:5555 \
+            -e NODE_ENV=production \
+            -e API_PORT=5555 \
+            -e API_URL=http://localhost \
+            -e DATABASE_URL="$DB" \
+            -e DATABASE_DIRECT_URL="$DB" \
+            -e DATABASE_READ_URL="$DB" \
+            -e DATABASE_WRITE_URL="$DB" \
+            -e REDIS_URL="redis://redis:6379" \
+            -e NEXTAUTH_SECRET="smoke-test-only-not-a-real-secret" \
+            -e JWT_SECRET="smoke-test-only-not-a-real-secret" \
+            -e CALENDSO_ENCRYPTION_KEY="smoke-test-only-not-a-secret-32b" \
+            -e STRIPE_API_KEY="sk_test_smoke" \
+            -e STRIPE_WEBHOOK_SECRET="whsec_smoke" \
+            -e WEB_APP_URL="https://cal.arielsaez.me" \
+            -e API_KEY_PREFIX="cal_" \
+            -e ENABLE_SLOTS_WORKERS=false \
+            "$REF_IMAGE"
+
+          ok=0
+          for i in $(seq 1 60); do
+            code="$(curl -o /tmp/health.txt -s -w '%{http_code}' http://127.0.0.1:5555/health || true)"
+            if [ "$code" = "200" ]; then
+              echo "API sana tras $((i*5))s (HTTP 200, cuerpo: $(cat /tmp/health.txt))"; ok=1; break
+            fi
+            if ! docker ps --format '{{.Names}}' | grep -qx api-smoke; then
+              echo "::error::El contenedor se detuvo solo"; break
+            fi
+            sleep 5
+          done
+
+          if [ "$ok" -ne 1 ]; then
+            echo "::group::Logs"; docker logs --tail 200 api-smoke || true; echo "::endgroup::"
+            echo "::error::Smoke test fallido: /health nunca respondió 200"
+            exit 1
+          fi
+
+          # La razón de ser de esta imagen: que una API key autentique. Sin cabecera debe dar 401,
+          # y con una clave inventada también. Si diera 404, el enrutado /v2 no está donde creemos.
+          code_sin="$(curl -o /dev/null -s -w '%{http_code}' http://127.0.0.1:5555/v2/me || true)"
+          code_mala="$(curl -o /dev/null -s -w '%{http_code}' \
+                        -H 'Authorization: Bearer cal_clave_inventada' http://127.0.0.1:5555/v2/me || true)"
+          echo "GET /v2/me sin cabecera → $code_sin ; con clave inválida → $code_mala"
+          if [ "$code_sin" != "401" ] || [ "$code_mala" != "401" ]; then
+            echo "::group::Logs"; docker logs --tail 200 api-smoke || true; echo "::endgroup::"
+            echo "::error::/v2/me no devolvió 401/401 (esperado). Enrutado o autenticación distintos de lo previsto."
+            exit 1
+          fi
+
+          echo "::group::Últimos logs"; docker logs --tail 60 api-smoke || true; echo "::endgroup::"
+
+      # -------------------------------------------------------------------------------------
+      - name: Publicar en GHCR
+        id: push
+        if: ${{ inputs.push }}
+        env:
+          REF_IMAGE: ${{ steps.meta.outputs.image }}:${{ steps.tag.outputs.value }}
+        run: |
+          set -euo pipefail
+          docker push "$REF_IMAGE"
+          digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "$REF_IMAGE" | sed 's/.*@//')"
+          if ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::no se pudo leer el digest publicado"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Publicada $REF_IMAGE@$digest"
+
+      # -------------------------------------------------------------------------------------
+      - name: Resumen (líneas para deploy/VERSION.lock)
+        if: always()
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAG: ${{ steps.tag.outputs.value }}
+          SHA_FULL: ${{ steps.meta.outputs.sha_full }}
+          SHA_SHORT: ${{ steps.meta.outputs.sha_short }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          PATCH_LIST: ${{ steps.patches.outputs.list }}
+          PUSHED: ${{ inputs.push }}
+        run: |
+          set -euo pipefail
+          size_h="desconocido"
+          if docker image inspect "$IMAGE:$TAG" >/dev/null 2>&1; then
+            size_h="$(docker image inspect --format '{{.Size}}' "$IMAGE:$TAG" \
+                      | awk '{printf "%.2f GB", $1/1024/1024/1024}')"
+          fi
+          FECHA_BUILD="$(date -u +%Y-%m-%d)"
+          {
+            echo "## Imagen API v2 de Cal.diy"
+            echo ""
+            echo "| Campo | Valor |"
+            echo "|---|---|"
+            echo "| Origen | \`$UPSTREAM_REPO@$SHA_FULL\` |"
+            echo "| Imagen | \`$IMAGE:$TAG\` |"
+            echo "| Digest | \`${DIGEST:-no publicada}\` |"
+            echo "| Tamaño | $size_h |"
+            echo "| Parches | $PATCH_LIST |"
+            echo "| Publicada | $PUSHED |"
+            echo ""
+            echo "> La web debe estar en el MISMO SHA (\`$SHA_SHORT\`). Comparten esquema de Prisma."
+            echo ""
+            echo "### Pegar en \`deploy/VERSION.lock\`"
+            echo ""
+            echo '```dotenv'
+            echo "CALDIY_API_IMAGE_REF=$IMAGE:$TAG"
+            echo "CALDIY_API_DIGEST=${DIGEST:-<no publicada>}"
+            echo "CALDIY_API_IMAGE_SIZE=$size_h"
+            echo "CALDIY_API_BUILD_RUN=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "CALDIY_API_BUILD_FECHA=$FECHA_BUILD"
+            echo '```'
+            echo ""
+            echo "### Y en el \`.env\` de la VPS"
+            echo ""
+            echo '```dotenv'
+            echo "CALDIY_API_IMAGE=$IMAGE:$TAG@${DIGEST:-<digest>}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Limpieza
+        if: always()
+        run: |
+          set +e
+          docker rm -f api-smoke database redis >/dev/null 2>&1
+          docker network rm smokenet >/dev/null 2>&1
+          exit 0
