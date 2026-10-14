@@ -107,27 +107,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # La API y la web comparten esquema de Prisma. Si la web publicada no está en este mismo SHA, el
-      # despliegue quedaría descompensado. Se comprueba aquí, antes de gastar 40 minutos de build.
-      - name: Verificar emparejamiento con la imagen web
-        if: ${{ !inputs.skip_pairing_check }}
-        env:
-          SHA_FULL: ${{ steps.resolve.outputs.sha }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          tag_esperado="$(printf '%s' "$SHA_FULL" | cut -c1-8)"
-          echo "Buscando ghcr.io/${owner}/${WEB_IMAGE_NAME}:${tag_esperado}"
-          if docker manifest inspect "ghcr.io/${owner}/${WEB_IMAGE_NAME}:${tag_esperado}" >/dev/null 2>&1; then
-            echo "OK: existe la imagen web del mismo SHA."
-          else
-            echo "::error::No existe ghcr.io/${owner}/${WEB_IMAGE_NAME}:${tag_esperado}."
-            echo "::error::Construye primero la web con build-image.yml (ref=$SHA_FULL), o relanza"
-            echo "::error::este workflow con skip_pairing_check=true si sabes lo que haces."
-            exit 1
-          fi
-
       # -------------------------------------------------------------------------------------
       - name: Liberar disco del runner
         run: |
@@ -194,22 +173,40 @@ jobs:
             git -C upstream apply --stat --apply "../$p"
             names="${names:+$names,}$(basename "$p")"
           done
+          patch_sha="$(cat "${patches[@]}" | sha256sum | cut -d' ' -f1)"
+          echo "sha256=$patch_sha" >> "$GITHUB_OUTPUT"
           echo "applied=${#patches[@]}" >> "$GITHUB_OUTPUT"
           echo "list=$names" >> "$GITHUB_OUTPUT"
-          echo "::warning::Imagen con ${#patches[@]} parche(s): $names. Se etiquetará con sufijo -patched."
+          echo "::warning::Imagen con ${#patches[@]} parche(s): $names. La etiqueta incluirá el hash de los parches."
 
       - name: Etiqueta final
         id: tag
         env:
           BASE_TAG: ${{ steps.meta.outputs.tag }}
           APPLIED: ${{ steps.patches.outputs.applied }}
+          PATCH_SHA: ${{ steps.patches.outputs.sha256 }}
         run: |
           set -euo pipefail
           if [ "$APPLIED" -gt 0 ]; then
-            echo "value=${BASE_TAG}-patched" >> "$GITHUB_OUTPUT"
+            echo "value=${BASE_TAG}-p${PATCH_SHA:0:12}" >> "$GITHUB_OUTPUT"
           else
             echo "value=${BASE_TAG}" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Verificar pareja exacta de SHA y parches
+        if: ${{ !inputs.skip_pairing_check }}
+        env:
+          SHA_FULL: ${{ steps.meta.outputs.sha_full }}
+          FINAL_TAG: ${{ steps.tag.outputs.value }}
+          PATCH_SHA: ${{ steps.patches.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          web="ghcr.io/${owner}/${WEB_IMAGE_NAME}:${FINAL_TAG}"
+          docker pull "$web"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$web")" = "$SHA_FULL"
+          test "$(docker image inspect --format '{{index .Config.Labels "me.ariel.caldiy.patchset"}}' "$web")" = "$PATCH_SHA"
+          test "$(docker run --rm --network none --entrypoint node "$web" --version)" = v24.21.0
 
       # -------------------------------------------------------------------------------------
       # A diferencia de la web, el build de la API no necesita una base viva: `prisma generate` y
@@ -235,6 +232,8 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
             org.opencontainers.image.revision=${{ steps.meta.outputs.sha_full }}
             org.opencontainers.image.title=cal-diy-api-v2
+            me.ariel.caldiy.patchset=${{ steps.patches.outputs.sha256 }}
+            me.ariel.caldiy.node=24.21.0
 
       # -------------------------------------------------------------------------------------
       - name: Verificar la imagen (sin credenciales de build en la configuración)
@@ -343,6 +342,23 @@ jobs:
           echo "::group::Últimos logs"; docker logs --tail 60 api-smoke || true; echo "::endgroup::"
 
       # -------------------------------------------------------------------------------------
+      - name: Verificar Node 24 y modulos nativos
+        env:
+          REF_IMAGE: ${{ steps.meta.outputs.image }}:${{ steps.tag.outputs.value }}
+        run: |
+          set -euo pipefail
+          test "$(docker run --rm --network none --entrypoint node "$REF_IMAGE" --version)" = v24.21.0
+          docker run --rm --network none --entrypoint node -w /calcom "$REF_IMAGE" -e '
+            const assert = require("node:assert/strict");
+            const {pack,unpack}=require("msgpackr");
+            assert.equal(unpack(pack({probe:42})).probe,42);
+            require("deasync").runLoopOnce();
+            const sqlite=require("sqlite3");
+            const db=new sqlite.Database(":memory:");
+            db.get("SELECT 42 AS probe",(error,row)=>{if(error)throw error;assert.equal(row.probe,42);db.close();});
+            require("sharp")({create:{width:2,height:2,channels:4,background:{r:0,g:0,b:0,alpha:1}}}).png().toBuffer().then(b=>assert.ok(b.length>0)).catch(e=>{console.error(e);process.exitCode=1;});
+          '
+
       - name: Publicar en GHCR
         id: push
         if: ${{ inputs.push }}
