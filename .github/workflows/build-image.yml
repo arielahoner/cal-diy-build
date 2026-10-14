@@ -175,19 +175,22 @@ jobs:
             git -C upstream apply --stat --apply "../$p"
             names="${names:+$names,}$(basename "$p")"
           done
+          patch_sha="$(cat "${patches[@]}" | sha256sum | cut -d' ' -f1)"
+          echo "sha256=$patch_sha" >> "$GITHUB_OUTPUT"
           echo "applied=${#patches[@]}" >> "$GITHUB_OUTPUT"
           echo "list=$names" >> "$GITHUB_OUTPUT"
-          echo "::warning::Imagen con ${#patches[@]} parche(s): $names. Se etiquetará con sufijo -patched."
+          echo "::warning::Imagen con ${#patches[@]} parche(s): $names. La etiqueta incluirá el hash de los parches."
 
       - name: Etiqueta final
         id: tag
         env:
           BASE_TAG: ${{ steps.meta.outputs.tag }}
           APPLIED: ${{ steps.patches.outputs.applied }}
+          PATCH_SHA: ${{ steps.patches.outputs.sha256 }}
         run: |
           set -euo pipefail
           if [ "$APPLIED" -gt 0 ]; then
-            echo "value=${BASE_TAG}-patched" >> "$GITHUB_OUTPUT"
+            echo "value=${BASE_TAG}-p${PATCH_SHA:0:12}" >> "$GITHUB_OUTPUT"
           else
             echo "value=${BASE_TAG}" >> "$GITHUB_OUTPUT"
           fi
@@ -253,6 +256,12 @@ jobs:
             CALCOM_TELEMETRY_DISABLED=1
             DATABASE_URL=postgresql://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@${{ env.DATABASE_HOST }}/${{ env.POSTGRES_DB }}
             DATABASE_DIRECT_URL=postgresql://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@${{ env.DATABASE_HOST }}/${{ env.POSTGRES_DB }}
+
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.sha_full }}
+            me.ariel.caldiy.patchset=${{ steps.patches.outputs.sha256 }}
+            me.ariel.caldiy.node=24.21.0
 
       # -------------------------------------------------------------------------------------
       - name: Verificar la imagen (URL horneada y ausencia de credenciales de build)
@@ -344,6 +353,23 @@ jobs:
       # -------------------------------------------------------------------------------------
       # Se publica la MISMA imagen que acaba de pasar el smoke test (`docker push` de la imagen ya
       # cargada), no una reconstrucción: así no cabe que se publique algo distinto de lo probado.
+      - name: Verificar Node 24 y modulos nativos
+        env:
+          REF_IMAGE: ${{ steps.meta.outputs.image }}:${{ steps.tag.outputs.value }}
+        run: |
+          set -euo pipefail
+          test "$(docker run --rm --network none --entrypoint node "$REF_IMAGE" --version)" = v24.21.0
+          docker run --rm --network none --entrypoint node -w /calcom "$REF_IMAGE" -e '
+            const assert = require("node:assert/strict");
+            const {pack,unpack}=require("msgpackr");
+            assert.equal(unpack(pack({probe:42})).probe,42);
+            require("deasync").runLoopOnce();
+            const sqlite=require("sqlite3");
+            const db=new sqlite.Database(":memory:");
+            db.get("SELECT 42 AS probe",(error,row)=>{if(error)throw error;assert.equal(row.probe,42);db.close();});
+            require("sharp")({create:{width:2,height:2,channels:4,background:{r:0,g:0,b:0,alpha:1}}}).png().toBuffer().then(b=>assert.ok(b.length>0)).catch(e=>{console.error(e);process.exitCode=1;});
+          '
+
       - name: Publicar en GHCR
         id: push
         if: ${{ inputs.push }}
